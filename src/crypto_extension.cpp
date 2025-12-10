@@ -661,8 +661,6 @@ namespace duckdb
         RegisterHashAggType<float>(agg_set, LogicalType::FLOAT);
         RegisterHashAggType<double>(agg_set, LogicalType::DOUBLE);
 
-        loader.RegisterFunction(agg_set);
-        
         // crypto_hash_agg: Aggregate function for hashing multiple rows
         CreateAggregateFunctionInfo crypto_hash_agg_info(agg_set);
         crypto_hash_agg_info.descriptions.push_back({

@@ -5,7 +5,9 @@
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 #include <openssl/evp.h>
 #include <openssl/err.h>
@@ -28,7 +30,7 @@ namespace duckdb
         char err_buf[256];
         ERR_error_string_n(err, err_buf, sizeof(err_buf));
         std::string error_msg = prefix + ": " + err_buf;
-        throw InternalException(error_msg);
+        throw Exception(ExceptionType::INVALID_INPUT, error_msg);
     }
 
     std::string generate_random_string(size_t len)
@@ -270,72 +272,182 @@ namespace duckdb
     //     evp_ctx.Finalize();
     // }
 
-    inline void CryptoScalarFun(DataChunk &args, ExpressionState &state, Vector &result, int mode)
+    struct CipherBindData : public FunctionData
     {
-        // This is called with three arguments:
-        // 1. The cipher name
-        // 2. The key
-        // 3. The value
-        //
+        // Constructor for constant cipher name (resolved at bind time)
+        CipherBindData(int mode_, const EVP_CIPHER *cipher_) : mode(mode_), cipher(cipher_)
+        {
+        }
 
-        auto &hash_function_name_vector = args.data[0];
-        auto &key_vector = args.data[1];
-        auto &value_vector = args.data[2];
+        // Constructor for non-constant cipher name (resolved at runtime)
+        explicit CipherBindData(int mode_) : mode(mode_), cipher(nullptr)
+        {
+        }
 
-        TernaryExecutor::Execute<string_t, string_t, string_t, string_t>(
-            hash_function_name_vector, key_vector, value_vector, result, args.size(),
-            [&](string_t cipher_name, string_t key, string_t value)
+        unique_ptr<FunctionData> Copy() const override
+        {
+            return make_uniq<CipherBindData>(mode, cipher);
+        }
+
+        bool Equals(const FunctionData &other_p) const override
+        {
+            auto &other = other_p.Cast<CipherBindData>();
+            return mode == other.mode && cipher == other.cipher;
+        }
+
+        const int mode;
+        const EVP_CIPHER *cipher; // nullptr if cipher name is not constant
+    };
+
+    unique_ptr<FunctionData> CipherBind(ClientContext &context, ScalarFunction &bound_function,
+                                        vector<unique_ptr<Expression>> &arguments)
+    {
+        int mode;
+        if (bound_function.name == "crypto_encrypt")
+        {
+            mode = MODE_ENCRYPT;
+        }
+        else if (bound_function.name == "crypto_decrypt")
+        {
+            mode = MODE_DECRYPT;
+        }
+        else
+        {
+            throw InternalException("Unknown cipher function: " + bound_function.name);
+        }
+
+        // If bind has already happened (e.g., during deserialization), return nullptr
+        if (arguments.size() == 2)
+        {
+            return nullptr;
+        }
+
+        // Check if the cipher name argument is constant
+        if (arguments.size() >= 1 && arguments[0]->IsFoldable() && !arguments[0]->HasParameter())
+        {
+            Value cipher_value = ExpressionExecutor::EvaluateScalar(context, *arguments[0]);
+            if (!cipher_value.IsNull())
             {
-                string algorithm(cipher_name.GetData(), cipher_name.GetSize());
-                string key_str(key.GetData(), key.GetSize());
-                string value_str(value.GetData(), value.GetSize());
-
-                // TODO: handle iv properly
-                // TODO: only allow the algorithm to be set once  instead of per row
-                std::string algo_lower = StringUtil::Lower(algorithm);
-                const EVP_CIPHER *cipher = EVP_get_cipherbyname(algo_lower.c_str());
-
+                auto cipher_name = StringUtil::Lower(cipher_value.GetValue<std::string>());
+                const EVP_CIPHER *cipher = EVP_get_cipherbyname(cipher_name.c_str());
                 if (!cipher)
                 {
-                    throw InvalidInputException("Invalid ciphername '" + algorithm + "'");
+                    throw InvalidInputException("Invalid ciphername '" + cipher_name + "'");
                 }
+                // Erase the cipher name argument since it's now stored in bind data
+                Function::EraseArgument(bound_function, arguments, 0);
+                return make_uniq<CipherBindData>(mode, cipher);
+            }
+        }
 
-                if (mode == 0)
-                { // decrypt
-                    CipherText ct(cipher, value_str);
-                    std::string decrypted = ct.Decrypt(reinterpret_cast<const unsigned char *>(key_str.data()));
-                    return StringVector::AddStringOrBlob(result, string_t(decrypted.data(), decrypted.size()));
-                }
-                else if (mode == 1)
-                { // encrypt
-                    CipherText ct = CipherText::Encrypt(cipher, reinterpret_cast<const unsigned char *>(key_str.data()), value_str);
-                    return StringVector::AddStringOrBlob(result, string_t(ct.GetValue().data(), ct.GetValue().size()));
-                }
-                else
+        // Cipher name is not constant, will be resolved at runtime
+        return make_uniq<CipherBindData>(mode);
+    }
+
+    inline void CryptoScalarFun(DataChunk &args, ExpressionState &state, Vector &result)
+    {
+        // Get bind data
+        auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
+        auto &bind_data = func_expr.bind_info->Cast<CipherBindData>();
+        int mode = bind_data.mode;
+
+        // If cipher was resolved at bind time, we have 2 arguments (key, value)
+        // Otherwise we have 3 arguments (cipher_name, key, value)
+        if (bind_data.cipher != nullptr)
+        {
+            // Cipher is constant - use BinaryExecutor
+            auto &key_vector = args.data[0];
+            auto &value_vector = args.data[1];
+            const EVP_CIPHER *cipher = bind_data.cipher;
+
+            BinaryExecutor::Execute<string_t, string_t, string_t>(
+                key_vector, value_vector, result, args.size(),
+                [&](string_t key, string_t value)
                 {
-                    throw InternalException("Invalid mode for CryptoScalarFun");
-                }
-            });
-    }
+                    if (mode == MODE_DECRYPT)
+                    {
+                        CipherText ct(cipher, value.GetString());
+                        std::string decrypted = ct.Decrypt(reinterpret_cast<const unsigned char *>(key.GetData()));
+                        return StringVector::AddStringOrBlob(result, decrypted.data(), decrypted.size());
+                    }
+                    else
+                    {
+                        CipherText ct = CipherText::Encrypt(cipher, reinterpret_cast<const unsigned char *>(key.GetData()), value.GetString());
+                        return StringVector::AddStringOrBlob(result, ct.GetValue());
+                    }
+                });
+        }
+        else
+        {
+            // Cipher name is not constant - resolve at runtime
+            auto &cipher_name_vector = args.data[0];
+            auto &key_vector = args.data[1];
+            auto &value_vector = args.data[2];
 
-    inline void CryptoScalarEncryptFun(DataChunk &args, ExpressionState &state, Vector &result)
-    {
-        CryptoScalarFun(args, state, result, MODE_ENCRYPT);
-    }
+            TernaryExecutor::Execute<string_t, string_t, string_t, string_t>(
+                cipher_name_vector, key_vector, value_vector, result, args.size(),
+                [&](string_t cipher_name, string_t key, string_t value)
+                {
+                    std::string algo_lower = StringUtil::Lower(cipher_name.GetString());
+                    const EVP_CIPHER *cipher = EVP_get_cipherbyname(algo_lower.c_str());
 
-    inline void CryptoScalarDecryptFun(DataChunk &args, ExpressionState &state, Vector &result)
-    {
-        CryptoScalarFun(args, state, result, MODE_DECRYPT);
+                    if (!cipher)
+                    {
+                        throw InvalidInputException("Invalid ciphername '" + cipher_name.GetString() + "'");
+                    }
+
+                    if (mode == MODE_DECRYPT)
+                    {
+                        CipherText ct(cipher, value.GetString());
+                        std::string decrypted = ct.Decrypt(reinterpret_cast<const unsigned char *>(key.GetData()));
+                        return StringVector::AddStringOrBlob(result, decrypted.data(), decrypted.size());
+                    }
+                    else
+                    {
+                        CipherText ct = CipherText::Encrypt(cipher, reinterpret_cast<const unsigned char *>(key.GetData()), value.GetString());
+                        return StringVector::AddStringOrBlob(result, ct.GetValue());
+                    }
+                });
+        }
     }
 
     void LoadCipherInternal(ExtensionLoader &loader)
     {
-        // crypto_hash accepts VARCHAR for algorithm name and ANY type for the data to hash
-        auto crypto_encrypt_scalar_function = ScalarFunction("crypto_encrypt", {LogicalType::VARCHAR, LogicalType::BLOB, LogicalType::ANY}, LogicalType::BLOB, CryptoScalarEncryptFun);
-        loader.RegisterFunction(crypto_encrypt_scalar_function);
+        // Register crypto_encrypt with BLOB and VARCHAR data types
+        ScalarFunctionSet encrypt_set("crypto_encrypt");
+        encrypt_set.AddFunction(ScalarFunction(
+            {LogicalType::VARCHAR, LogicalType::BLOB, LogicalType::BLOB},
+            LogicalType::BLOB, CryptoScalarFun, CipherBind));
+        encrypt_set.AddFunction(ScalarFunction(
+            {LogicalType::VARCHAR, LogicalType::BLOB, LogicalType::VARCHAR},
+            LogicalType::BLOB, CryptoScalarFun, CipherBind));
+        CreateScalarFunctionInfo encrypt_info(encrypt_set);
+        encrypt_info.descriptions.push_back({{}, // parameter_types empty = applies to all overloads
+                                             {"cipher", "key", "plaintext"},
+                                             "Encrypts plaintext using the specified OpenSSL cipher and key. "
+                                             "Returns ciphertext as BLOB containing IV, encrypted data, and authentication tag (for AEAD ciphers). "
+                                             "Supported ciphers include aes-256-gcm, aes-128-gcm, aes-256-cbc, and other OpenSSL cipher names.",
+                                             {"crypto_encrypt('aes-256-gcm', key, 'secret message')"},
+                                             {"cryptography", "encryption"}});
+        loader.RegisterFunction(encrypt_info);
 
-        auto crypto_decrypt_scalar_function = ScalarFunction("crypto_decrypt", {LogicalType::VARCHAR, LogicalType::BLOB, LogicalType::ANY}, LogicalType::BLOB, CryptoScalarDecryptFun);
-        loader.RegisterFunction(crypto_decrypt_scalar_function);
+        // Register crypto_decrypt with BLOB and VARCHAR data types
+        ScalarFunctionSet decrypt_set("crypto_decrypt");
+        decrypt_set.AddFunction(ScalarFunction(
+            {LogicalType::VARCHAR, LogicalType::BLOB, LogicalType::BLOB},
+            LogicalType::BLOB, CryptoScalarFun, CipherBind));
+        decrypt_set.AddFunction(ScalarFunction(
+            {LogicalType::VARCHAR, LogicalType::BLOB, LogicalType::VARCHAR},
+            LogicalType::BLOB, CryptoScalarFun, CipherBind));
+        CreateScalarFunctionInfo decrypt_info(decrypt_set);
+        decrypt_info.descriptions.push_back({{}, // parameter_types empty = applies to all overloads
+                                             {"cipher", "key", "ciphertext"},
+                                             "Decrypts ciphertext using the specified OpenSSL cipher and key. "
+                                             "Expects ciphertext format produced by crypto_encrypt (IV + encrypted data + auth tag for AEAD ciphers). "
+                                             "The cipher and key must match those used for encryption.",
+                                             {"crypto_decrypt('aes-256-gcm', key, encrypted_data)"},
+                                             {"cryptography", "decryption"}});
+        loader.RegisterFunction(decrypt_info);
     }
 
 };
